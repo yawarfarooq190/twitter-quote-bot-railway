@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Railway Twitter Quote Bot
-Simplified version for Railway cron job deployment
+Updated version with tracking and no quote formatting
 """
 
 import os
@@ -58,8 +58,8 @@ class RailwayQuoteBot:
             # Parse JSON and create credentials
             service_account_info = json.loads(service_account_json)
             scopes = [
-                'https://www.googleapis.com/auth/spreadsheets.readonly',
-                'https://www.googleapis.com/auth/drive.readonly'
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive'
             ]
             
             credentials = Credentials.from_service_account_info(
@@ -89,9 +89,10 @@ class RailwayQuoteBot:
             all_records = self.worksheet.get_all_records()
             
             quotes = []
-            for row in all_records:
+            for idx, row in enumerate(all_records):
                 quote_text = None
                 author = None
+                posted = False
                 
                 # Look for quote text in common column names
                 for key in ['Quote', 'Text', 'Content', 'Message', 'quote', 'text']:
@@ -105,10 +106,18 @@ class RailwayQuoteBot:
                         author = str(row[key]).strip()
                         break
                 
+                # Check if already posted
+                for key in ['Posted', 'Tweeted', 'Used', 'posted', 'tweeted', 'used']:
+                    if key in row and str(row[key]).lower() in ['yes', 'true', '1', 'posted', 'tweeted']:
+                        posted = True
+                        break
+                
                 if quote_text:
                     quotes.append({
                         'text': quote_text,
-                        'author': author
+                        'author': author,
+                        'row_index': idx + 2,  # +2 because sheets are 1-indexed and we skip header
+                        'posted': posted
                     })
             
             logger.info(f"Successfully fetched {len(quotes)} quotes from Google Sheets")
@@ -118,13 +127,38 @@ class RailwayQuoteBot:
             logger.error(f"Error fetching quotes: {str(e)}")
             return []
     
+    def mark_as_posted(self, row_index):
+        """Mark quote as posted in the sheet"""
+        try:
+            # Try to find or create a 'Posted' column
+            headers = self.worksheet.row_values(1)
+            posted_col = None
+            
+            # Look for existing posted column
+            for i, header in enumerate(headers):
+                if header.lower() in ['posted', 'tweeted', 'used']:
+                    posted_col = i + 1
+                    break
+            
+            # If no posted column exists, create one
+            if posted_col is None:
+                posted_col = len(headers) + 1
+                self.worksheet.update_cell(1, posted_col, 'Posted')
+            
+            # Mark as posted
+            self.worksheet.update_cell(row_index, posted_col, 'Yes')
+            logger.info(f"Marked row {row_index} as posted")
+            
+        except Exception as e:
+            logger.error(f"Error marking quote as posted: {str(e)}")
+    
     def format_tweet(self, quote_data):
-        """Format quote into tweet"""
+        """Format quote into tweet (no quotes, just text)"""
         quote_text = quote_data['text']
         author = quote_data.get('author')
         
-        # Start with quoted text
-        tweet = f'"{quote_text}"'
+        # Start with just the text (no quotes)
+        tweet = quote_text
         
         # Add author if available
         if author:
@@ -132,10 +166,10 @@ class RailwayQuoteBot:
         
         # Ensure tweet fits Twitter's 280 character limit
         if len(tweet) > 280:
-            max_quote_length = 280 - len(' - ') - len(author or '') - 2
+            max_quote_length = 280 - len(' - ') - len(author or '')
             if max_quote_length > 50:
                 quote_text = quote_text[:max_quote_length-3] + '...'
-                tweet = f'"{quote_text}"'
+                tweet = quote_text
                 if author:
                     tweet += f' - {author}'
         
@@ -153,8 +187,16 @@ class RailwayQuoteBot:
                 logger.error("No quotes found in Google Sheets!")
                 return False
             
-            # Select random quote
-            selected_quote = random.choice(quotes)
+            # Filter unposted quotes
+            unposted_quotes = [q for q in quotes if not q['posted']]
+            
+            if not unposted_quotes:
+                logger.warning("All quotes have been posted! Consider adding more quotes.")
+                # Fall back to random quote from all quotes
+                selected_quote = random.choice(quotes)
+            else:
+                selected_quote = random.choice(unposted_quotes)
+            
             logger.info(f"Selected quote: {selected_quote['text'][:50]}...")
             
             # Format tweet
@@ -168,6 +210,10 @@ class RailwayQuoteBot:
                 logger.info(f"Tweet posted successfully!")
                 logger.info(f"Tweet ID: {tweet_id}")
                 logger.info(f"Tweet content: {tweet_text}")
+                
+                # Mark as posted in sheet
+                self.mark_as_posted(selected_quote['row_index'])
+                
                 return True
             else:
                 logger.error("Failed to post tweet - no response data")
